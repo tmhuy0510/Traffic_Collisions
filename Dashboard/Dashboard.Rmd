@@ -1,0 +1,670 @@
+---
+title: "HRM Traffic Collisions"
+author: "Henry Truong"
+date: "11/01/2022"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+runtime: shiny    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      warning = FALSE,
+                      comment = '',
+                      fig.align = 'center',
+                      fig.width = 7.5,
+                      fig.asp = 1/1.5)
+```
+
+```{r}
+library(tidyverse)
+library(modelr)
+library(lubridate)
+library(broom)
+library(infer)
+library(leaflet)
+library(knitr)
+library(kableExtra)
+library(flexdashboard)
+```
+
+```{r}
+set.seed(12345)
+```
+
+```{r}
+tc <- read_csv("./Traffic_Collisions.csv")
+```
+
+```{r}
+tc <- tc %>% 
+  rename_with(str_to_lower) %>% 
+  rename(aggressive_driving = agressive_driving) %>% 
+  rename_with(str_to_lower) %>% 
+  mutate(date = accident_date %>% str_extract('^.{10}') %>% ymd()) %>% 
+  mutate(non_fatal_injury = replace_na(
+           non_fatal_injury, 
+           'No'),
+         fatal_injury = replace_na(
+           fatal_injury, 
+           'No'),
+         collision_configuration = replace_na(
+           collision_configuration, 
+           'Not specified'),
+         road_configuration = replace_na(
+           road_configuration, 
+           'Not specified'),
+         road_location_2 = replace_na(
+           road_location_2, 
+           'Not specified')) %>% 
+  mutate(road_location_1 = case_when(
+    objectid == 2026 ~ 'Gottingen St',
+    objectid == 4170 ~ 'Circassion Dr',
+    objectid == 4478 ~ 'Old Guysborough Rd',
+    objectid == 11536 ~ 'Osborne Ave',
+    TRUE ~ road_location_1)) %>% 
+  mutate(across(road_location_1:collision_configuration, 
+                str_to_title)) %>% 
+  mutate(year = year(date),
+         month = month(date, label = TRUE),
+         dow = wday(date, label = TRUE))
+```
+
+```{r plot_function}
+daily_plot <- function(tc, select_year = 2021) {
+  tc %>% 
+    filter(year(date) == select_year) %>% 
+    count(date) %>%
+    ggplot(aes(x = date, y = n)) + 
+    geom_line(size = 1) + 
+    geom_smooth(se = F) +
+    labs(x = NULL, y = 'Number of Incidents', 
+         title = str_c('The Year of ', select_year)) +
+    scale_x_date(date_breaks = '1 month', date_labels = '%b') +
+    theme(text = element_text(size = 15))
+}
+```
+
+```{r plot_function_2}
+daily_timescale_barplot <- function(tc, timescale = 'year') {
+  tc %>%
+    mutate(time_scale = tc[[timescale]]) %>% 
+    count(date, time_scale) %>% 
+    group_by(time_scale) %>% 
+    summarize(n_mean = mean(n)) %>% 
+    ggplot(aes(x = as_factor(time_scale), y = n_mean)) +
+    labs(x = NULL, y = 'Average number of daily incidents') +
+    geom_col(fill = 'steelblue', width = 0.7)
+}
+daily_timescale_boxplot <- function(tc, timescale = 'year') {
+  tc %>% 
+    mutate(time_scale = tc[[timescale]]) %>% 
+    count(date, time_scale) %>% 
+    ggplot(aes(x = as_factor(time_scale),
+               y = n)) +
+    geom_boxplot() +
+    stat_summary(fun = mean, color = 'darkred') +
+    labs(x = NULL, y = 'Average number of daily incidents') +
+    coord_flip()
+}
+```
+
+```{r}
+road_name <- str_split(tc$road_location_1, 
+                       '^\\d*\\b', 
+                       simplify = T)[, 2] %>% 
+  str_trim()
+```
+
+```{r}
+tc_road_name = tc %>% 
+  mutate(road_name = road_name) %>% 
+  filter(!str_starts(road_name, '\\d'))
+```
+
+```{r}
+young_pie <- function(tc, incident = 'total') {
+  if (incident == 'fatal') {
+    tc_young <- tc %>% 
+      filter(fatal_injury == 'Yes')
+    title <- 'Regarding Fatal Incidents'
+  } else if (incident == 'injury') {
+    tc_young <- tc %>% 
+      filter(non_fatal_injury == 'Yes' | fatal_injury == 'Yes')
+    title <- 'Regarding Incidents with Injury'
+  } else {
+    tc_young <- tc
+    title <- 'Regarding Total Incidents'
+  }
+  tc_young %>% 
+    count(young_demographic) %>%
+    mutate(percent = n/sum(n) * 100,
+           ypos = cumsum(percent) - 0.5*percent) %>% 
+    ggplot(aes(x = '', y = percent)) +
+    geom_bar(aes(fill = fct_rev(young_demographic)), 
+             stat = 'identity',
+             color = 'white') +
+    scale_fill_brewer(palette = 'Dark2',
+                      name = NULL,
+                      labels = c('People under 25 yrs old',
+                                 'People at or over 25 yrs old')) +
+    coord_polar(theta = 'y') +
+    geom_text(aes(y = ypos, 
+                  label = str_c(round(percent, 1), '%')), 
+              color = "white", 
+              size = 10) +
+    theme_void() +
+    guides(fill = guide_legend(nrow = 1)) +
+    theme(legend.position = 'bottom',
+          plot.title = element_text(hjust = 0.5))
+}
+```
+
+```{r}
+wd_we_prop_injury <- tc %>%
+  group_by(date, dow) %>% 
+  summarize(
+    total = n(),
+    injury = sum(non_fatal_injury == 'Yes' | fatal_injury == 'Yes'),
+    prop_injury = injury/total) %>% 
+  mutate(wd_we = case_when(
+    dow == 'Sun' | dow == 'Sat' ~ 'Weekend',
+    TRUE ~ 'Weekday')) %>% 
+  select(wd_we, prop_injury)
+```
+
+```{r}
+wd_we_boot_distribution <- wd_we_prop_injury %>% 
+  specify(prop_injury ~ wd_we) %>% 
+  generate(reps = 10000, type = 'bootstrap') %>% 
+  calculate(stat = 'diff in means', order = c('Weekend', 'Weekday'))
+
+wd_we_ci_percentile <- wd_we_boot_distribution %>% 
+  get_ci(type = 'percentile', level = 0.95)
+```
+
+```{r}
+tc_agg <- tc %>% 
+  filter(aggressive_driving == 'Y',
+         distracted_driving == 'N',
+         impaired_driving == 'N') %>% 
+  mutate(injury = case_when(
+    non_fatal_injury == 'Yes' | fatal_injury == 'Yes' ~ 'Yes',
+    TRUE ~ 'No'))
+
+tc_imp <- tc %>% 
+  filter(aggressive_driving == 'N',
+         distracted_driving == 'N',
+         impaired_driving == 'Y') %>% 
+  mutate(injury = case_when(
+    non_fatal_injury == 'Yes' | fatal_injury == 'Yes' ~ 'Yes',
+    TRUE ~ 'No'))
+
+agg_imp <- tibble(
+  condition = c(rep('aggressive', nrow(tc_agg)),
+                rep('impaired', nrow(tc_imp))),
+  injury = c(tc_agg$injury, tc_imp$injury)) %>% 
+  sample_n(size = nrow(tc_agg) + nrow(tc_imp))
+```
+
+```{r}
+obs_diff_prop = agg_imp %>% 
+  specify(injury ~ condition, success = 'Yes') %>% 
+  calculate(stat = 'diff in props', 
+            order = c('impaired', 'aggressive'))
+
+agg_imp_null_distribution <- agg_imp %>% 
+  specify(injury ~ condition, success = 'Yes') %>% 
+  hypothesize(null = 'independence') %>% 
+  generate(reps = 10000, type = 'permute') %>% 
+  calculate(stat = 'diff in props', 
+            order = c('impaired', 'aggressive'))
+
+agg_imp_p_value <- agg_imp_null_distribution %>% 
+  get_p_value(obs_diff_prop, direction = 'right')
+```
+
+```{r}
+fri_sat_imp <- tc %>% 
+  mutate(fri_sat = case_when(
+    dow %in% c('Fri', 'Sat') ~ 'Friday/Saturday',
+    TRUE ~ 'Other days')) %>%
+  count(fri_sat, impaired_driving) 
+```
+
+```{r}
+storm_date <- tribble(
+  ~date, ~storm, 
+  '2021-01-02', 'snow',
+  '2021-01-22', 'snow',
+  '2021-03-19', 'snow',
+  '2020-11-03', 'snow',
+  '2020-02-10', 'snow', 
+  '2020-01-16', 'snow',
+  '2019-09-07', 'tropical',
+  '2019-09-08', 'tropical',
+  '2019-09-10', 'tropical',
+  '2019-09-09', 'tropical',
+  '2019-09-23', 'tropical',
+  '2019-09-22', 'tropical',
+  '2019-11-28', 'snow',
+  '2018-03-08', 'snow',
+  '2018-12-07', 'snow', 
+  '2018-11-16', 'snow'
+)
+storm_date <- storm_date %>% 
+  mutate(date = ymd(date))
+```
+
+```{r}
+tc_model_data <- left_join(tc, storm_date, by = 'date') %>% 
+  mutate(storm = replace_na(storm, 'normal')) %>% 
+  group_by(date, dow, month, storm) %>% 
+  summarize(n = n())
+```
+
+```{r}
+model1 <- lm(n ~ dow, data = tc_model_data)
+model2 <- lm(n ~ dow + storm, data = tc_model_data)
+model3 <- lm(n ~ dow + storm + month, data = tc_model_data)
+list_models <- list(dow = model1, 
+                   dow_with_storm = model2,
+                   dow_with_storm_month = model3)
+```
+
+
+Time
+===================================== 
+
+Column {data-width=700}
+-----------------------------------------------------------------------
+
+```{r}
+selectInput("year", label = "Select a year",
+            choices = c(2018, 2019, 2020, 2021), selected = 2021)
+```
+
+### Daily incident number in the selected year
+
+```{r}
+renderPlot({
+  daily_plot(tc, input$year)
+})
+```
+
+Column {data-width=300}
+-----------------------------------------------------------------------
+
+### Average daily incident number in 2018-2021
+
+#### 
+
+```{r, fig.width=4, fig.height=2}
+daily_timescale_barplot(tc, 'year')
+```
+
+#### 
+
+```{r, fig.width=4}
+daily_timescale_boxplot(tc, 'year')
+```
+
+Time Scale
+===================================== 
+
+Column {data-width=330}
+-----------------------------------------------------------------------
+
+```{r}
+radioButtons('timescale', 'Select a timescale',
+             choiceNames = c('Month', 'Day of week'),
+             choiceValues = c('month', 'dow'),
+             inline = TRUE)
+```
+
+
+### Average daily incident number among the selected timescale
+
+```{r, fig.height=10, fig.width=5}
+renderPlot({
+  time_scale_plot <- daily_timescale_barplot(tc, input$timescale) + 
+    coord_flip() +
+    theme(text = element_text(size = 15))
+  if (input$timescale == 'month') {
+    time_scale_plot + 
+      geom_col(fill = c(rep('steelblue', 3),
+                        'darkolivegreen',
+                        rep('steelblue', 7),
+                        'darkred'))
+  } else {
+    time_scale_plot +
+      geom_col(fill = c('darkolivegreen',
+                        rep('steelblue', 4),
+                        'darkred',
+                        'steelblue'))
+  }
+   
+})
+```
+
+Column {data-width=670}
+-----------------------------------------------------------------------
+
+### Distribution of daily incident number {data-height=200}
+
+```{r, fig.asp=1/2}
+tc %>% 
+  count(date) %>% 
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 3, boundary = 0, 
+                 color = 'white', fill = 'steelblue') +
+  scale_x_continuous(breaks = seq(0, 90, by = 9)) +
+  labs(x = "Daily incident number",
+       y = "Count") +
+  theme(text = element_text(size = 9))
+```
+
+
+### Summary table of daily incident number {data-height=27}
+```{r}
+renderTable({
+  summary_table <- tc %>% 
+    count(date) %>% 
+    .$n %>% 
+    summary() %>% 
+    as.list() %>% 
+    data.frame()
+  colnames(summary_table) <- c('Minimum', '1st Quantile', 
+                               'Median', 'Mean',
+                               '3rd Quantile', 'Maximum')
+  summary_table
+})
+```
+
+Geography 
+===================================== 
+
+Column {data-width=670}
+-----------------------------------------------------------------------
+
+### Distribution of incidents across HRM
+
+```{r}
+tc %>% 
+  select(lat = wgs84_lat_coord, 
+         lng = wgs84_lon_coord) %>% 
+  leaflet() %>% 
+  addTiles() %>% 
+  addMarkers(clusterOptions = markerClusterOptions())
+```
+
+Row {data-width=330 .tabset}
+-----------------------------------------------------------------------
+
+```{r}
+wellPanel(fluidRow(column(
+  7,
+  sliderInput('n', 'Top N Roads', 
+            min = 3, max = 10, 
+            step = 1, value = 10,)
+)))
+```
+
+### Total incidents
+
+```{r, fig.asp=2}
+renderPlot({
+  tc_road_name %>% 
+  count(road_name) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:input$n) %>% 
+  ggplot(aes(x = fct_reorder(road_name, n), y = n)) +
+  geom_col(fill = 'steelblue', width = 0.9*input$n/10) +
+  labs(x = NULL, y = "Number of Incidents") +
+  coord_flip() +
+  theme(text = element_text(size = 15))
+})
+```
+
+### Incidents with injury
+
+```{r}
+renderPlot({
+  tc_road_name %>% 
+  filter(non_fatal_injury == 'Yes' | fatal_injury == 'Yes') %>% 
+  count(road_name) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:input$n) %>% 
+  ggplot(aes(x = fct_reorder(road_name, n), y = n)) +
+  geom_col(fill = 'steelblue', width = 0.9*input$n/10) +
+  labs(x = NULL, y = "Number of Incidents with Injury") +
+  coord_flip() +
+  theme(text = element_text(size = 15))
+})
+```
+
+### Fatal incidents
+
+```{r}
+renderPlot({
+  tc_road_name %>% 
+  filter(fatal_injury == 'Yes') %>% 
+  count(road_name) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:input$n) %>% 
+  ggplot(aes(x = fct_reorder(road_name, n), y = n)) +
+  geom_col(fill = 'steelblue', width = 0.9*input$n/10) +
+  labs(x = NULL, y = "Number of Fatal Incidents") +
+  coord_flip() +
+  theme(text = element_text(size = 15))
+})
+```
+
+Collision and Driver Characteristics
+===================================== 
+
+Column {data-width=600, .tabset}
+-------------------------------------
+
+### Total incidents
+
+```{r}
+tc %>% 
+  filter(collision_configuration != 'Not Specified') %>% 
+  count(collision_configuration) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:10) %>% 
+  ggplot(aes(x = fct_reorder(collision_configuration, n), y = n)) +
+  geom_col(fill = 'steelblue') +
+  labs(x = NULL, y = "Number of Incidents") +
+  coord_flip() +
+  theme(text = element_text(size = 12))
+```
+
+### Incidents with injury
+
+```{r}
+tc %>% 
+  filter(collision_configuration != 'Not Specified') %>% 
+  filter(non_fatal_injury == 'Yes' | fatal_injury == 'Yes') %>% 
+  count(collision_configuration) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:10) %>% 
+  ggplot(aes(x = fct_reorder(collision_configuration, n), y = n)) +
+  geom_col(fill = 'steelblue') +
+  labs(x = NULL, y = "Number of Incidents with Injury") +
+  coord_flip() +
+  theme(text = element_text(size = 12))
+```
+
+### Fatal incidents
+
+```{r}
+tc %>% 
+  filter(collision_configuration != 'Not Specified') %>% 
+  filter(fatal_injury == 'Yes') %>% 
+  count(collision_configuration) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:10) %>% 
+  ggplot(aes(x = fct_reorder(collision_configuration, n), y = n)) +
+  geom_col(fill = 'steelblue') +
+  labs(x = NULL, y = "Number of Fatal Incidents") +
+  coord_flip() +
+  theme(text = element_text(size = 12))
+```
+
+Column {data-width=400 .tabset}
+-------------------------------------
+
+### Total incidents
+
+```{r, fig.asp=1}
+young_pie(tc, 'total') +
+  theme(text = element_text(size = 20))
+```
+
+### Incidents with injury
+
+```{r, fig.asp=1}
+young_pie(tc, 'injury') +
+  theme(text = element_text(size = 20))
+```
+
+### Fatal incidents
+
+```{r, fig.asp=1}
+young_pie(tc, 'fatal') +
+  theme(text = element_text(size = 20))
+```
+
+Statistical Inference 
+===================================== 
+
+```{r}
+selectInput(
+    'con_lev', 'Select the level of confidence',
+    c(0.90, 0.95, 0.99)
+    )
+```
+
+Column {data-width=400}
+-------------------------------------
+
+### Data Visualization {data-height=500}
+```{r, fig.asp=1/1.5}
+wd_we_prop_injury %>% 
+  ggplot(aes(x = wd_we, y = prop_injury)) +
+  geom_boxplot() +
+  stat_summary(fun = mean, color = 'darkred', size = 0.5) +
+  labs(x = NULL, y = "Proportion of Incidents with Injury") +
+  coord_flip() + 
+  theme(text = element_text(size = 15))
+```
+
+### Confident interval {data-height=150}
+```{r}
+renderTable(
+  wd_we_ci_percentile <- wd_we_boot_distribution %>% 
+    get_ci(type = 'percentile', level = as.numeric(input$con_lev))
+)
+```
+
+Column {data-width=600, data-height=600}
+-------------------------------------
+
+### Bootstrap Distribution
+```{r}
+renderPlot({
+  wd_we_ci_percentile <- wd_we_boot_distribution %>% 
+    get_ci(type = 'percentile', level = as.numeric(input$con_lev))
+  wd_we_boot_distribution %>%
+  visualize() +
+  shade_ci(wd_we_ci_percentile) +
+  labs(x = 'Diffence in Mean Proportions between\n Weekday and Weekend',
+       y = 'Count',
+       title = str_c('The ', input$con_lev, ' Confident Interval Contains 0')) + 
+  theme(text = element_text(size = 15))
+})
+```
+
+
+Predictive Model
+===================================== 
+
+Column
+-------------------------------------
+
+### Model 1: Day of week
+
+```{r, fig.asp= 1/3}
+tc_model_data %>% 
+  gather_residuals(dow = model1, 
+                   dow_with_storm = model2, 
+                   dow_with_storm_month = model3) %>% 
+  filter(model == 'dow') %>% 
+  ggplot(aes(date, resid)) +
+  geom_line() + 
+  geom_smooth(se = F) +
+  labs(x = "Date", y = "Residual") +
+  geom_hline(yintercept = 0, size = 1, colour = "white")
+```
+
+### Model 2: Day of week and severe weather
+
+```{r, fig.asp=1/3}
+tc_model_data %>% 
+  gather_residuals(dow = model1, 
+                   dow_with_storm = model2, 
+                   dow_with_storm_month = model3) %>% 
+  filter(model == 'dow_with_storm') %>% 
+  ggplot(aes(date, resid)) +
+  geom_line() + 
+  geom_smooth(se = F) +
+  labs(x = "Date", y = "Residual") +
+  geom_hline(yintercept = 0, size = 1, colour = "white")
+```
+
+Column
+-------------------------------------
+
+### Model 3: Day of week, severe weather and month {data-height=500}
+
+```{r, fig.asp=1/3, fig.width=7.5}
+tc_model_data %>% 
+  gather_residuals(dow = model1, 
+                   dow_with_storm = model2, 
+                   dow_with_storm_month = model3) %>% 
+  filter(model == 'dow_with_storm_month') %>% 
+  ggplot(aes(date, resid)) +
+  geom_line() + 
+  geom_smooth(se = F) +
+  labs(x = "Date", y = "Residual") +
+  geom_hline(yintercept = 0, size = 1, colour = "white")
+```
+
+### Model and R-squared summary {data-height=500}
+
+####
+```{r, echo=T}
+model1 <- lm(n ~ dow, data = tc_model_data)
+model2 <- lm(n ~ dow + storm, data = tc_model_data)
+model3 <- lm(n ~ dow + storm + month, data = tc_model_data)
+```
+
+####
+```{r}
+renderTable(
+  list_models %>% 
+  map_dbl(~ summary(.)[['r.squared']]) %>% 
+  enframe(name = 'model', value = 'r_squared')
+)
+```
+
+
+
+
+
